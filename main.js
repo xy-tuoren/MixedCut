@@ -172,11 +172,55 @@ async function listAdbDevices() {
   return parseAdbDevicesOutput(result.stdout);
 }
 
+async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
+  const fileUri = `file://${remoteFilePath}`;
+  const dirUri = `file://${remoteDirPath}`;
+
+  // 兼容不同 Android 版本：先按文件扫描，再尝试按目录扫描。
+  await runCommand("adb", [
+    "-s",
+    serial,
+    "shell",
+    "am",
+    "broadcast",
+    "-a",
+    "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+    "-d",
+    fileUri
+  ]).catch(() => {});
+
+  await runCommand("adb", [
+    "-s",
+    serial,
+    "shell",
+    "am",
+    "broadcast",
+    "-a",
+    "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+    "-d",
+    dirUri
+  ]).catch(() => {});
+
+  // 新系统上的额外兜底扫描命令（部分机型不支持，失败可忽略）。
+  await runCommand("adb", [
+    "-s",
+    serial,
+    "shell",
+    "cmd",
+    "media",
+    "scan",
+    "--file",
+    remoteFilePath
+  ]).catch(() => {});
+}
+
 async function pushToAdbDevice(serial, adbDirPath, localFilePath) {
   const normalizedDir = adbDirPath.replace(/\\/g, "/").trim();
   await runCommand("adb", ["-s", serial, "shell", "mkdir", "-p", normalizedDir]);
   await runCommand("adb", ["-s", serial, "push", localFilePath, normalizedDir]);
-  return path.posix.join(normalizedDir, path.basename(localFilePath));
+  const remoteFilePath = path.posix.join(normalizedDir, path.basename(localFilePath));
+  await triggerAdbMediaScan(serial, remoteFilePath, normalizedDir);
+  return remoteFilePath;
 }
 
 async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, videoBrightness) {
