@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MixedCut 混剪工具</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>MixedCut 混剪工具</h1>
+
+      <section class="panel">
+        <h2>1) 目录选择</h2>
+        <p class="hint">素材目录下应包含多个子文件夹，每个子文件夹放该段可用片段。</p>
+        <div class="row">
+          <button id="btnPickSource">选择素材文件夹</button>
+          <span id="sourcePath" class="path"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>2) 片段顺序规则（可选）</h2>
+        <p class="hint">
+          格式示例：<code>1-2</code>。表示前两个片段按子文件夹 1、2 固定，后续子文件夹随机排序并随机选片段。
+        </p>
+        <div class="row">
+          <input id="orderInput" type="text" placeholder="例如：1-2-3（可留空）" />
+        </div>
+        <div id="subfolderList" class="subfolder-list">尚未选择素材文件夹。</div>
+      </section>
+
+      <section class="panel">
+        <h2>3) 输出设置</h2>
+        <div class="row">
+          <label>保存位置：</label>
+          <label><input type="radio" name="saveTarget" value="local" checked /> 本地文件夹</label>
+          <label><input type="radio" name="saveTarget" value="adb" /> 手机(ADB)</label>
+        </div>
+        <div id="localOutputSettings" class="local-output-settings">
+          <div class="row">
+            <button id="btnPickOutput">选择输出文件夹</button>
+            <span id="outputPath" class="path"></span>
+          </div>
+        </div>
+        <div class="row">
+          <label for="outputCount">生成视频数量：</label>
+          <input id="outputCount" type="number" min="1" value="3" />
+          <span id="maxComboInfo" class="hint-inline">最大可生成组合数：-</span>
+        </div>
+        <div id="adbSettings" class="adb-settings hidden">
+          <div class="row">
+            <button id="btnRefreshAdb">检测 ADB 设备</button>
+            <select id="adbDeviceSelect">
+              <option value="">请先检测设备</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="adbPathInput">手机保存路径：</label>
+            <input id="adbPathInput" type="text" value="/sdcard/DCIM/Camera/mixedcut" />
+          </div>
+        </div>
+        <div class="row">
+          <label for="audioVolume">输出音量倍率：</label>
+          <input id="audioVolume" type="range" min="0" max="2" step="0.1" value="0" />
+          <span id="audioVolumeValue" class="value-chip">0.0</span>
+          <span class="hint-inline">0=静音，1=原音，2=双倍</span>
+        </div>
+        <div class="row">
+          <label for="videoBrightness">视频亮度：</label>
+          <input id="videoBrightness" type="range" min="-1" max="1" step="0.05" value="0" />
+          <span id="videoBrightnessValue" class="value-chip">0.00</span>
+          <span class="hint-inline">-1.00~1.00，0 为不调整</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <button id="btnStart" class="primary">开始混剪</button>
+      </section>
+
+      <section class="panel">
+        <h2>运行日志</h2>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

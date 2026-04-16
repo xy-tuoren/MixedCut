@@ -1,0 +1,38 @@
+{
+  "name": "mixedcut-electron",
+  "version": "1.0.0",
+  "description": "Electron app for random video mixing with static ffmpeg.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win nsis",
+    "pack:win": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.mixedcut.app",
+    "productName": "MixedCut",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    }
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  }
+}
