@@ -1,12 +1,13 @@
 {
   "name": "mixedcut-electron",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Electron app for random video mixing with static ffmpeg.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist:win": "electron-builder --win nsis",
-    "pack:win": "electron-builder --win portable"
+    "prepare:adb:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\download-adb.ps1",
+    "dist:win": "npm run prepare:adb:win && electron-builder --win nsis",
+    "pack:win": "npm run prepare:adb:win && electron-builder --win portable"
   },
   "build": {
     "appId": "com.mixedcut.app",
@@ -14,6 +15,15 @@
     "asar": true,
     "asarUnpack": [
       "node_modules/ffmpeg-static/**"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/adb/win",
+        "to": "adb",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "files": [
       "main.js",

@@ -40,6 +40,13 @@ function resolveFfmpegPath() {
   return ffmpegStatic;
 }
 
+function resolveBundledAdbPath() {
+  if (process.platform !== "win32") return null;
+  if (!app.isPackaged) return null;
+  const bundled = path.join(process.resourcesPath, "adb", "adb.exe");
+  return fsSync.existsSync(bundled) ? bundled : null;
+}
+
 async function pickDirectory() {
   const result = await dialog.showOpenDialog({
     properties: ["openDirectory"]
@@ -143,7 +150,17 @@ function runCommand(command, args) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
-    child.on("error", (error) => reject(error));
+    child.on("error", (error) => {
+      if (error && error.code === "ENOENT") {
+        reject(
+          new Error(
+            `未找到可执行文件：${command}。如果你选择了手机(ADB)保存，请安装/配置 adb，或在安装包内置 adb 后重新打包。`
+          )
+        );
+        return;
+      }
+      reject(error);
+    });
     child.on("close", (code) => {
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${command} 执行失败（退出码 ${code}）: ${stderr || stdout}`));
@@ -168,16 +185,18 @@ function parseAdbDevicesOutput(raw) {
 }
 
 async function listAdbDevices() {
-  const result = await runCommand("adb", ["devices", "-l"]);
+  const adbCommand = resolveBundledAdbPath() || "adb";
+  const result = await runCommand(adbCommand, ["devices", "-l"]);
   return parseAdbDevicesOutput(result.stdout);
 }
 
 async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
+  const adbCommand = resolveBundledAdbPath() || "adb";
   const fileUri = `file://${remoteFilePath}`;
   const dirUri = `file://${remoteDirPath}`;
 
   // 兼容不同 Android 版本：先按文件扫描，再尝试按目录扫描。
-  await runCommand("adb", [
+  await runCommand(adbCommand, [
     "-s",
     serial,
     "shell",
@@ -189,7 +208,7 @@ async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
     fileUri
   ]).catch(() => {});
 
-  await runCommand("adb", [
+  await runCommand(adbCommand, [
     "-s",
     serial,
     "shell",
@@ -202,7 +221,7 @@ async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
   ]).catch(() => {});
 
   // 新系统上的额外兜底扫描命令（部分机型不支持，失败可忽略）。
-  await runCommand("adb", [
+  await runCommand(adbCommand, [
     "-s",
     serial,
     "shell",
@@ -215,9 +234,10 @@ async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
 }
 
 async function pushToAdbDevice(serial, adbDirPath, localFilePath) {
+  const adbCommand = resolveBundledAdbPath() || "adb";
   const normalizedDir = adbDirPath.replace(/\\/g, "/").trim();
-  await runCommand("adb", ["-s", serial, "shell", "mkdir", "-p", normalizedDir]);
-  await runCommand("adb", ["-s", serial, "push", localFilePath, normalizedDir]);
+  await runCommand(adbCommand, ["-s", serial, "shell", "mkdir", "-p", normalizedDir]);
+  await runCommand(adbCommand, ["-s", serial, "push", localFilePath, normalizedDir]);
   const remoteFilePath = path.posix.join(normalizedDir, path.basename(localFilePath));
   await triggerAdbMediaScan(serial, remoteFilePath, normalizedDir);
   return remoteFilePath;
@@ -233,11 +253,9 @@ async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, video
 
   const args = [
     "-y",
-    // 对损坏数据尽量容错，避免单个坏帧导致整次混剪失败
+    // 生成更稳定时间戳，减少拼接后画面抖动/跳帧
     "-fflags",
-    "+genpts+discardcorrupt",
-    "-err_detect",
-    "ignore_err",
+    "+genpts",
     "-f",
     "concat",
     "-safe",
@@ -248,10 +266,18 @@ async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, video
     "libx264",
     "-vf",
     `eq=brightness=${videoBrightness}`,
+    "-vsync",
+    "cfr",
+    "-r",
+    "30",
+    "-pix_fmt",
+    "yuv420p",
     "-preset",
-    "veryfast",
+    "medium",
     "-crf",
-    "23"
+    "18",
+    "-movflags",
+    "+faststart"
   ];
   if (audioVolume <= 0) {
     // 音量为 0 时直接不输出音轨，可规避大量音频损坏导致的失败
@@ -273,18 +299,11 @@ async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, video
         if (code === 0) resolve();
         else reject(new Error(`ffmpeg 执行失败（退出码 ${code}）`));
       });
-    }).catch(async (error) => {
-      // 某些素材虽有解码报错，但 ffmpeg 末尾非 0 且仍产出可播放文件；这里做兜底
-      try {
-        const stat = await fs.stat(outputFile);
-        if (stat.size > 0) {
-          return;
-        }
-      } catch (_e) {
-        // no-op
-      }
-      throw new Error(`${error.message}: ${stderr}`);
     });
+  } catch (error) {
+    // 非 0 退出时清理半成品，避免把短视频残片误当作成功输出
+    await fs.unlink(outputFile).catch(() => {});
+    throw new Error(`${error.message}: ${stderr}`);
   } finally {
     await fs.unlink(tempListPath).catch(() => {});
   }
