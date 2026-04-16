@@ -261,11 +261,17 @@ async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, video
     "-safe",
     "0",
     "-i",
-    tempListPath,
+    tempListPath
+  ];
+
+  // 亮度为 0 时不加视频滤镜，减少不必要的重编码开销
+  if (videoBrightness !== 0) {
+    args.push("-vf", `eq=brightness=${videoBrightness}`);
+  }
+
+  args.push(
     "-c:v",
     "libx264",
-    "-vf",
-    `eq=brightness=${videoBrightness}`,
     "-vsync",
     "cfr",
     "-r",
@@ -273,15 +279,18 @@ async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, video
     "-pix_fmt",
     "yuv420p",
     "-preset",
-    "medium",
+    "fast",
     "-crf",
     "18",
     "-movflags",
     "+faststart"
-  ];
+  );
   if (audioVolume <= 0) {
     // 音量为 0 时直接不输出音轨，可规避大量音频损坏导致的失败
     args.push("-an");
+  } else if (audioVolume === 1) {
+    // 音量不变时直接复制音轨，避免不必要的音频重编码
+    args.push("-c:a", "copy");
   } else {
     args.push("-af", `volume=${audioVolume}`, "-c:a", "aac", "-b:a", "192k");
   }
