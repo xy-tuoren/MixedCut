@@ -3,6 +3,7 @@ const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const os = require("os");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 const ffmpegStatic = require("ffmpeg-static");
 
@@ -286,6 +287,10 @@ async function pushToAdbDevice(serial, adbDirPath, localFilePath) {
 const OUTPUT_WIDTH = 1080;
 const OUTPUT_HEIGHT = 1920;
 const OUTPUT_FPS = 30;
+const ENCODE_CACHE_NAMESPACE = "v1";
+const ENCODE_CACHE_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8GB
+const ENCODE_CACHE_TRIM_TARGET_BYTES = 6 * 1024 * 1024 * 1024; // 6GB
+const ENCODE_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
 
 let cachedHwEncoder;
 let hwEncoderDetectionPromise = null;
@@ -438,37 +443,370 @@ function pushVideoEncoderArgs(args, hwEncoder) {
   }
 }
 
+function getEncodeCacheRoot() {
+  // userData 在开发态/打包态都可写，适合作为持久缓存目录。
+  return path.join(app.getPath("userData"), "encoded-clip-cache");
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function buildCachedClipKey(clipPath, stat, audioVolume, videoBrightness) {
+  const payload = [
+    ENCODE_CACHE_NAMESPACE,
+    clipPath,
+    String(stat.size),
+    String(Math.floor(stat.mtimeMs)),
+    `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}@${OUTPUT_FPS}`,
+    `volume=${audioVolume}`,
+    `brightness=${videoBrightness}`
+  ].join("|");
+  return crypto.createHash("sha1").update(payload).digest("hex");
+}
+
+function getCachedClipPath(cacheRoot, cacheKey) {
+  return path.join(cacheRoot, cacheKey.slice(0, 2), `${cacheKey}.mp4`);
+}
+
+function buildCacheAudioFilter(audioVolume) {
+  let audioFilter =
+    "aresample=async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100";
+  if (audioVolume !== 1) audioFilter += `,volume=${audioVolume}`;
+  return audioFilter;
+}
+
+async function transcodeClipToCache(ffmpegPath, sourceClip, outputClip, audioVolume, videoBrightness) {
+  await fs.mkdir(path.dirname(outputClip), { recursive: true });
+  const tempClip = path.join(
+    path.dirname(outputClip),
+    `${path.basename(outputClip, ".mp4")}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`
+  );
+  const args = ["-y", "-i", sourceClip, "-map", "0:v:0", "-vf", buildNormalizeFilter(videoBrightness)];
+
+  if (audioVolume > 0) {
+    args.push("-map", "0:a:0?", "-af", buildCacheAudioFilter(audioVolume), "-c:a", "aac", "-b:a", "128k");
+  } else {
+    args.push("-an");
+  }
+  args.push(
+    "-r",
+    String(OUTPUT_FPS),
+    "-fps_mode",
+    "cfr",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-threads",
+    "0",
+    "-movflags",
+    "+faststart",
+    tempClip
+  );
+
+  try {
+    await spawnFfmpeg(ffmpegPath, args);
+    try {
+      await fs.rename(tempClip, outputClip);
+    } catch (renameError) {
+      if (await fileExists(outputClip)) {
+        await fs.unlink(tempClip).catch(() => {});
+      } else {
+        throw renameError;
+      }
+    }
+  } catch (error) {
+    await fs.unlink(tempClip).catch(() => {});
+    throw error;
+  }
+}
+
+const cachedClipInflightMap = new Map();
+
+async function getOrCreateCachedClip(
+  ffmpegPath,
+  sourceClip,
+  cacheRoot,
+  audioVolume,
+  videoBrightness,
+  reportProgress
+) {
+  const stat = await fs.stat(sourceClip);
+  const cacheKey = buildCachedClipKey(sourceClip, stat, audioVolume, videoBrightness);
+  const cachedClip = getCachedClipPath(cacheRoot, cacheKey);
+  if (await fileExists(cachedClip)) {
+    const now = new Date();
+    await fs.utimes(cachedClip, now, now).catch(() => {});
+    return cachedClip;
+  }
+  if (cachedClipInflightMap.has(cachedClip)) {
+    return cachedClipInflightMap.get(cachedClip);
+  }
+
+  const inflight = (async () => {
+    reportProgress(`缓存转码：${path.basename(sourceClip)}`);
+    await transcodeClipToCache(ffmpegPath, sourceClip, cachedClip, audioVolume, videoBrightness);
+    return cachedClip;
+  })();
+
+  cachedClipInflightMap.set(cachedClip, inflight);
+  try {
+    return await inflight;
+  } finally {
+    cachedClipInflightMap.delete(cachedClip);
+  }
+}
+
+async function listCacheFiles(cacheRoot) {
+  const files = [];
+  const walk = async (dirPath) => {
+    let entries = [];
+    try {
+      entries = await fs.readdir(dirPath, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".mp4")) continue;
+      try {
+        const st = await fs.stat(full);
+        files.push({ path: full, size: st.size, mtimeMs: st.mtimeMs });
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  };
+  await walk(cacheRoot);
+  return files;
+}
+
+async function cleanupEncodeCache(cacheRoot, reportProgress) {
+  await fs.mkdir(cacheRoot, { recursive: true });
+  const files = await listCacheFiles(cacheRoot);
+  if (!files.length) return;
+  const now = Date.now();
+
+  // 先清理过期项
+  const expired = files.filter((f) => now - f.mtimeMs > ENCODE_CACHE_TTL_MS);
+  for (const item of expired) {
+    await fs.unlink(item.path).catch(() => {});
+  }
+
+  const alive = files.filter((f) => now - f.mtimeMs <= ENCODE_CACHE_TTL_MS);
+  let totalBytes = alive.reduce((s, f) => s + f.size, 0);
+  if (totalBytes <= ENCODE_CACHE_MAX_BYTES) return;
+
+  // 超额后按最久未使用优先删除，直到回落到目标水位
+  const sortedByOldest = [...alive].sort((a, b) => a.mtimeMs - b.mtimeMs);
+  for (const item of sortedByOldest) {
+    if (totalBytes <= ENCODE_CACHE_TRIM_TARGET_BYTES) break;
+    await fs.unlink(item.path).catch(() => {});
+    totalBytes -= item.size;
+  }
+
+  if (reportProgress) {
+    reportProgress(`缓存清理完成，剩余 ${(totalBytes / 1024 / 1024).toFixed(0)} MB`);
+  }
+}
+
+// ---------- 片段元数据探测 ----------
+// 缓存每个片段的编码/分辨率/声道等，用于「同格式优先」与「流拷贝极速路径」判断
+const clipMetaCache = new Map();
+
+function parseFfmpegMeta(stderrText) {
+  const meta = { video: null, audio: null };
+  // 例：Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv), 1080x1920, 6908 kb/s, 26.66 fps
+  const vm = stderrText.match(
+    /Stream\s+#\d+:\d+[^\n]*?Video:\s+(\w+)[^,]*,\s*([^\s,()]+)(?:\([^)]+\))?[^,]*,\s*(\d+)x(\d+)[^,]*?,\s*(?:[\d.]+\s*kb\/s,\s*)?([\d.]+)\s*fps/i
+  );
+  if (vm) {
+    meta.video = {
+      codec: vm[1].toLowerCase(),
+      pixFmt: vm[2].toLowerCase(),
+      width: Number(vm[3]),
+      height: Number(vm[4]),
+      fps: Math.round(Number(vm[5]) * 100) / 100
+    };
+  }
+  // 例：Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp, 65 kb/s
+  const am = stderrText.match(
+    /Stream\s+#\d+:\d+[^\n]*?Audio:\s+(\w+)[^,]*,\s*(\d+)\s*Hz,\s*(mono|stereo|[\d.]+\s*channels?)/i
+  );
+  if (am) {
+    meta.audio = {
+      codec: am[1].toLowerCase(),
+      sampleRate: Number(am[2]),
+      channelLayout: am[3].toLowerCase().trim().replace(/\s+/g, "")
+    };
+  }
+  return meta;
+}
+
+function probeClipMeta(ffmpegPath, clip) {
+  if (clipMetaCache.has(clip)) return Promise.resolve(clipMetaCache.get(clip));
+  return new Promise((resolve) => {
+    let finished = false;
+    const child = spawn(
+      ffmpegPath,
+      ["-hide_banner", "-i", clip, "-f", "null", "-"],
+      { windowsHide: true }
+    );
+    let stderr = "";
+    if (child.stdout) child.stdout.on("data", () => {});
+    child.stderr.on("data", (c) => {
+      stderr += c.toString();
+    });
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      try {
+        child.kill("SIGKILL");
+      } catch (_) {
+        /* ignore */
+      }
+      const meta = parseFfmpegMeta(stderr);
+      clipMetaCache.set(clip, meta);
+      resolve(meta);
+    }, 8000);
+    child.on("error", () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clipMetaCache.set(clip, { video: null, audio: null });
+      resolve({ video: null, audio: null });
+    });
+    child.on("close", () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      const meta = parseFfmpegMeta(stderr);
+      clipMetaCache.set(clip, meta);
+      resolve(meta);
+    });
+  });
+}
+
+function formatKey(meta) {
+  if (!meta || !meta.video) return "unknown";
+  const v = meta.video;
+  const a = meta.audio;
+  return [
+    v.codec,
+    v.pixFmt,
+    `${v.width}x${v.height}`,
+    `${v.fps}fps`,
+    a ? `${a.codec}/${a.sampleRate}/${a.channelLayout}` : "noaudio"
+  ].join("|");
+}
+
+async function probeAllClips(ffmpegPath, clips, reportProgress) {
+  const uniq = [...new Set(clips)];
+  const notCached = uniq.filter((c) => !clipMetaCache.has(c));
+  if (notCached.length === 0) return;
+  if (reportProgress) reportProgress(`正在探测 ${notCached.length} 个片段的编码参数...`);
+  const CONC = 4;
+  let idx = 0;
+  const workers = Array.from({ length: CONC }, async () => {
+    while (idx < notCached.length) {
+      const my = idx;
+      idx += 1;
+      await probeClipMeta(ffmpegPath, notCached[my]);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// ---------- ffmpeg 子进程执行 ----------
+function spawnFfmpeg(ffmpegPath, args) {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => reject(error));
+    child.on("close", (code) => {
+      if (code === 0) resolve(stderr);
+      else {
+        const tail = stderr.slice(-600);
+        reject(new Error(`ffmpeg 执行失败（退出码 ${code}）: ${tail}`));
+      }
+    });
+  });
+}
+
+// ---------- 流拷贝极速路径 ----------
+// 前置条件：所有 clip 编码参数完全一致、音量=1、亮度=0
+async function runFfmpegStreamCopy(ffmpegPath, clips, outputFile) {
+  const tempListPath = path.join(
+    os.tmpdir(),
+    `mixedcut-cp-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`
+  );
+  await fs.writeFile(tempListPath, clips.map(toConcatFileLine).join("\n"), "utf-8");
+  try {
+    await spawnFfmpeg(ffmpegPath, [
+      "-y",
+      "-fflags",
+      "+genpts",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      tempListPath,
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      outputFile
+    ]);
+  } finally {
+    await fs.unlink(tempListPath).catch(() => {});
+  }
+}
+
 async function runFfmpegConcat(
   ffmpegPath,
   clips,
   outputFile,
   audioVolume,
   videoBrightness,
-  hwEncoder
+  hwEncoder,
+  options = {}
 ) {
-  const runArgs = (args) =>
-    new Promise((resolve, reject) => {
-      let stderr = "";
-      const child = spawn(ffmpegPath, args, { windowsHide: true });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-      child.on("error", (error) => reject(error));
-      child.on("close", (code) => {
-        if (code === 0) resolve(stderr);
-        else {
-          const tail = stderr.slice(-600);
-          reject(new Error(`ffmpeg 执行失败（退出码 ${code}）: ${tail}`));
-        }
-      });
-    });
-
+  const { allowCopy = false } = options;
   const videoFilter = buildNormalizeFilter(videoBrightness);
   const hasAudio = audioVolume > 0;
 
-  // concat filter：逐片独立解码并统一到 1080x1920@30、立体声 44.1kHz
-  // 必须用此路径：不同素材的编码/分辨率/声道/像素格式常常不一致，
-  // concat demuxer 在这种情况下会失败或极慢（逐帧艰难输出）。
+  // 1) 流拷贝极速路径（同格式 + 不改音量/亮度）
+  if (allowCopy) {
+    try {
+      await runFfmpegStreamCopy(ffmpegPath, clips, outputFile);
+      return { mode: "copy" };
+    } catch (_copyError) {
+      // 流拷贝失败（timebase/SPS 细微差异等）→ 回落到滤镜重编码
+      await fs.unlink(outputFile).catch(() => {});
+    }
+  }
+
+  // 2) concat filter：逐片独立解码并统一到 1080x1920@30
+  //    必须用此路径：不同素材的编码/分辨率/声道/像素格式常常不一致，
+  //    concat demuxer 在这种情况下会失败或极慢（逐帧艰难输出）。
   const buildFilterArgs = (useHwEncoder) => {
     const args = ["-y"];
     for (const clip of clips) args.push("-i", clip);
@@ -504,13 +842,14 @@ async function runFfmpegConcat(
 
   try {
     try {
-      await runArgs(buildFilterArgs(hwEncoder));
-      return;
+      await spawnFfmpeg(ffmpegPath, buildFilterArgs(hwEncoder));
+      return { mode: hwEncoder || "libx264" };
     } catch (hwError) {
       if (!hwEncoder) throw hwError;
-      // 硬件编码单次失败时兜底用 libx264（例如 QSV 输入异常、驱动暂挂起等）
+      // 硬件编码失败兜底用 libx264（如 QSV 输入异常、驱动暂挂起等）
       await fs.unlink(outputFile).catch(() => {});
-      await runArgs(buildFilterArgs(null));
+      await spawnFfmpeg(ffmpegPath, buildFilterArgs(null));
+      return { mode: "libx264(fallback)" };
     }
   } catch (error) {
     await fs.unlink(outputFile).catch(() => {});
@@ -620,91 +959,226 @@ ipcMain.handle("start-mix", async (event, payload) => {
       ? outputDir
       : path.join(os.tmpdir(), `mixedcut-output-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   await fs.mkdir(finalOutputDir, { recursive: true });
-  const usedCombinations = new Set();
+
+  // ===== 阶段一：预探测所有片段编码参数，按格式分组 =====
+  const allClipsFlat = folderClips.flat();
+  await probeAllClips(ffmpegPath, allClipsFlat, reportProgress);
+
+  // 每个子文件夹内按 formatKey 聚类
+  const folderGroupsByKey = folderClips.map((clips) => {
+    const groups = new Map();
+    for (const clip of clips) {
+      const key = formatKey(clipMetaCache.get(clip));
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(clip);
+    }
+    return groups;
+  });
+
+  // 在所有子文件夹中都存在的 formatKey（跨文件夹交集）
+  const commonKeys = folderGroupsByKey.length
+    ? [...folderGroupsByKey[0].keys()]
+        .filter((k) => k !== "unknown" && folderGroupsByKey.every((g) => g.has(k)))
+        .sort(
+          (a, b) =>
+            folderGroupsByKey.reduce((s, g) => s + (g.get(b) ? g.get(b).length : 0), 0) -
+            folderGroupsByKey.reduce((s, g) => s + (g.get(a) ? g.get(a).length : 0), 0)
+        )
+    : [];
+  const canStreamCopy = volume === 1 && brightness === 0;
+  if (commonKeys.length > 0) {
+    reportProgress(
+      `发现 ${commonKeys.length} 种跨文件夹同格式的组合${
+        canStreamCopy ? "，将优先走流拷贝极速路径" : "（因音量/亮度已调，仍需重编码）"
+      }`
+    );
+  } else {
+    reportProgress("未发现跨文件夹同格式组合，将全部走重编码路径");
+  }
+
+  // ===== 阶段二：预生成 N 组唯一组合（优先同格式） =====
   const clipFailScores = new Map();
-  const results = [];
+  const usedCombinations = new Set();
+  const combos = [];
+
+  const buildMatchedPick = (order, forbidden) => {
+    // 随机在同格式 key 里挑一个，保证所有 folder 都有这种 key 的片段
+    const keys = shuffle(commonKeys);
+    for (const key of keys) {
+      const clips = order.map((folderIdx) => {
+        const pool = folderGroupsByKey[folderIdx].get(key) || [];
+        return pool.length ? pickRandom(pool) : null;
+      });
+      if (clips.some((c) => !c)) continue;
+      const uk = buildUniqueKey(order, clips);
+      if (!forbidden.has(uk)) return { clips, matchedKey: key, uniqueKey: uk };
+    }
+    return null;
+  };
+
+  const buildAnyPick = (order, forbidden) => {
+    for (let t = 0; t < 30; t += 1) {
+      const clips = order.map((folderIdx) =>
+        pickClipWithPenalty(folderClips[folderIdx], clipFailScores)
+      );
+      if (clips.some((c) => !c)) continue;
+      const uk = buildUniqueKey(order, clips);
+      if (!forbidden.has(uk)) return { clips, matchedKey: null, uniqueKey: uk };
+    }
+    return null;
+  };
 
   for (let i = 0; i < count; i += 1) {
-    let finalOrder = null;
-    let pickedClips = null;
-    let uniqueKey = null;
-    let lastConcatError = null;
-    const triedKeysThisVideo = new Set();
-
-    for (let retry = 0; retry < 500; retry += 1) {
+    let picked = null;
+    for (let retry = 0; retry < 500 && !picked; retry += 1) {
       const order = buildOrder(prefixOrder, folderClips.length);
-      const clips = order.map((folderIdx) => pickClipWithPenalty(folderClips[folderIdx], clipFailScores));
-      if (clips.some((clip) => !clip)) {
-        continue;
+      // 前 70% 次尝试偏好同格式；失败或没有同格式再回退到任意组合
+      if (commonKeys.length > 0 && retry < 350) {
+        picked = buildMatchedPick(order, usedCombinations);
       }
-      const key = buildUniqueKey(order, clips);
-      if (usedCombinations.has(key) || triedKeysThisVideo.has(key)) {
-        continue;
+      if (!picked) {
+        picked = buildAnyPick(order, usedCombinations);
       }
-
-      const outputFile = path.join(finalOutputDir, `mixed_${String(i + 1).padStart(3, "0")}.mp4`);
-      await fs.unlink(outputFile).catch(() => {});
-      if (retry === 0) {
-        reportProgress(`#${i + 1}/${count} 开始编码（顺序 ${order.map((x) => x + 1).join("-")}）`);
-      } else {
-        reportProgress(`#${i + 1}/${count} 第 ${retry + 1} 次尝试...`);
-      }
-      const encodeStart = Date.now();
-      try {
-        await runFfmpegConcat(ffmpegPath, clips, outputFile, volume, brightness, hwEncoder);
-        finalOrder = order;
-        pickedClips = clips;
-        uniqueKey = key;
-        reportProgress(
-          `#${i + 1}/${count} 完成，用时 ${((Date.now() - encodeStart) / 1000).toFixed(1)}s`
-        );
-        break;
-      } catch (error) {
-        lastConcatError = error;
-        triedKeysThisVideo.add(key);
-        for (const clip of clips) {
-          clipFailScores.set(clip, (clipFailScores.get(clip) || 0) + 1);
-        }
-        reportProgress(
-          `#${i + 1}/${count} 第 ${retry + 1} 次失败，换一组重试：${(error.message || "").slice(0, 120)}`
-        );
-      }
+      if (picked) picked.order = order;
     }
-
-    if (!pickedClips || !finalOrder || !uniqueKey) {
-      const suffix = lastConcatError ? `；最近一次失败原因：${lastConcatError.message}` : "";
+    if (!picked) {
       throw new Error(
-        `无法生成第 ${i + 1} 个可用视频：候选组合已耗尽或素材片段存在损坏，请补充/替换片段后重试${suffix}`
+        `无法生成第 ${i + 1} 个可用组合：候选组合已耗尽，请减少产出数量或增加片段数`
       );
     }
+    usedCombinations.add(picked.uniqueKey);
+    combos.push(picked);
+  }
 
-    usedCombinations.add(uniqueKey);
-    const outputFile = path.join(finalOutputDir, `mixed_${String(i + 1).padStart(3, "0")}.mp4`);
+  const matchedCount = combos.filter((c) => c.matchedKey).length;
+  reportProgress(
+    `组合已分配：同格式 ${matchedCount} 条，混合格式 ${count - matchedCount} 条`
+  );
+  const encodeCacheRoot = getEncodeCacheRoot();
+  const useEncodedClipCache = !(canStreamCopy && matchedCount === count);
+  if (useEncodedClipCache) {
+    reportProgress(`已启用转码缓存：${encodeCacheRoot}`);
+  }
+
+  // ===== 阶段三：并发执行 =====
+  // 流拷贝是 I/O 限定，可以并发更多；硬件编码受 GPU 会话数限制；CPU 编码更少
+  const cpuCount = Math.max(2, os.cpus().length || 4);
+  let concurrency;
+  if (canStreamCopy && matchedCount === count) {
+    concurrency = Math.min(8, cpuCount);
+  } else if (hwEncoder) {
+    concurrency = Math.min(3, cpuCount);
+  } else {
+    concurrency = Math.min(2, cpuCount);
+  }
+  if (concurrency > count) concurrency = count;
+  reportProgress(`并发 ${concurrency} 条同时编码`);
+
+  const results = new Array(count);
+  const outputFiles = combos.map((_, i) =>
+    path.join(finalOutputDir, `mixed_${String(i + 1).padStart(3, "0")}.mp4`)
+  );
+  let completed = 0;
+  const totalStart = Date.now();
+
+  const runOneTask = async (i) => {
+    const { order, clips, matchedKey } = combos[i];
+    const outputFile = outputFiles[i];
+    await fs.unlink(outputFile).catch(() => {});
+    const tagMode = useEncodedClipCache
+      ? "缓存复用"
+      : canStreamCopy && matchedKey
+        ? "流拷贝"
+        : matchedKey
+          ? "同格式/重编码"
+          : "重编码";
+    reportProgress(
+      `#${i + 1}/${count} 开始（${tagMode}；顺序 ${order.map((x) => x + 1).join("-")}）`
+    );
+    const t = Date.now();
+    let mode;
+    if (useEncodedClipCache) {
+      const cachedClips = await Promise.all(
+        clips.map((clip) =>
+          getOrCreateCachedClip(ffmpegPath, clip, encodeCacheRoot, volume, brightness, reportProgress)
+        )
+      );
+      mode = await runFfmpegConcat(ffmpegPath, cachedClips, outputFile, 1, 0, null, { allowCopy: true });
+    } else {
+      mode = await runFfmpegConcat(ffmpegPath, clips, outputFile, volume, brightness, hwEncoder, {
+        allowCopy: canStreamCopy && !!matchedKey
+      });
+    }
+    completed += 1;
+    reportProgress(
+      `#${i + 1}/${count} 完成（${mode.mode || "?"}，用时 ${((Date.now() - t) / 1000).toFixed(
+        1
+      )}s）[进度 ${completed}/${count}]`
+    );
     let savedPath = outputFile;
     if (targetType === "adb") {
       savedPath = await pushToAdbDevice(adbSerial, adbPath, outputFile);
       await fs.unlink(outputFile).catch(() => {});
     }
-
-    results.push({
+    results[i] = {
       outputFile,
       savedPath,
-      folderOrder: finalOrder.map((idx) => idx + 1),
-      clips: pickedClips
-    });
-  }
+      folderOrder: order.map((idx) => idx + 1),
+      clips
+    };
+  };
+
+  // 工作池
+  let nextIndex = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (true) {
+      const my = nextIndex;
+      nextIndex += 1;
+      if (my >= count) return;
+      try {
+        await runOneTask(my);
+      } catch (error) {
+        // 单条失败：不中止其它任务，只记录
+        for (const clip of combos[my].clips) {
+          clipFailScores.set(clip, (clipFailScores.get(clip) || 0) + 1);
+        }
+        reportProgress(
+          `#${my + 1}/${count} 失败：${(error.message || String(error)).slice(0, 200)}`
+        );
+        results[my] = { error: error.message || String(error) };
+      }
+    }
+  });
+  await Promise.all(workers);
+
+  const ok = results.filter((r) => r && !r.error);
+  const failed = results.filter((r) => r && r.error);
+  reportProgress(
+    `全部完成：成功 ${ok.length}/${count}，失败 ${failed.length}，总用时 ${(
+      (Date.now() - totalStart) /
+      1000
+    ).toFixed(1)}s`
+  );
 
   if (targetType === "adb") {
     await fs.rm(finalOutputDir, { recursive: true, force: true }).catch(() => {});
   }
+  if (useEncodedClipCache) {
+    await cleanupEncodeCache(encodeCacheRoot, reportProgress).catch(() => {});
+  }
 
   return {
-    generated: results.length,
+    generated: ok.length,
+    failed: failed.length,
     ffmpegPath,
     hwEncoder: hwEncoder || null,
     outputSpec: `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}@${OUTPUT_FPS}`,
     targetType,
-    results
+    concurrency,
+    matchedCombos: matchedCount,
+    encodedCacheUsed: useEncodedClipCache,
+    streamCopyUsed: canStreamCopy && matchedCount > 0,
+    results: ok
   };
 });
 

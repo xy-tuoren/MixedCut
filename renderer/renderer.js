@@ -257,7 +257,9 @@ btnStartEl.addEventListener("click", async () => {
       adbPath: adbPathInputEl.value.trim()
     });
 
-    appendLog(`完成，共生成 ${result.generated} 个视频。`);
+    appendLog(
+      `完成，共生成 ${result.generated} 个视频${result.failed ? `（失败 ${result.failed}）` : ""}。`
+    );
     appendLog(`ffmpeg 路径：${result.ffmpegPath}`);
     if (result.outputSpec) {
       appendLog(`输出规格：${result.outputSpec}`);
@@ -265,6 +267,16 @@ btnStartEl.addEventListener("click", async () => {
     appendLog(
       `编码器：${result.hwEncoder ? `${result.hwEncoder}（硬件加速）` : "libx264（CPU）"}`
     );
+    if (typeof result.concurrency === "number") {
+      appendLog(`并发数：${result.concurrency}`);
+    }
+    if (typeof result.matchedCombos === "number") {
+      appendLog(
+        `同格式组合：${result.matchedCombos} 条${
+          result.streamCopyUsed ? "（已启用流拷贝极速路径）" : ""
+        }`
+      );
+    }
     appendLog(`保存目标：${result.targetType === "adb" ? "手机(ADB)" : "本地文件夹"}`);
     appendLog(`输出音量倍率：${audioVolume}`);
     appendLog(`视频亮度：${videoBrightness.toFixed(2)}`);
