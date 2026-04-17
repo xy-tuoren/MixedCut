@@ -32,6 +32,12 @@ function appendLog(text) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+if (window.mixedCutApi && typeof window.mixedCutApi.onMixProgress === "function") {
+  window.mixedCutApi.onMixProgress((data) => {
+    if (data && data.message) appendLog(data.message);
+  });
+}
+
 function renderAdjustValue() {
   audioVolumeValueEl.textContent = Number(audioVolumeEl.value).toFixed(1);
   videoBrightnessValueEl.textContent = Number(videoBrightnessEl.value).toFixed(2);
@@ -73,8 +79,15 @@ function renderAdbDevices() {
 
 async function refreshAdbDevices() {
   try {
+    const previousSelectedSerial = adbDeviceSelectEl.value;
     state.adbDevices = await window.mixedCutApi.listAdbDevices();
     renderAdbDevices();
+    if (state.adbDevices.length) {
+      const hasPrevious = state.adbDevices.some((item) => item.serial === previousSelectedSerial);
+      const selectedSerial = hasPrevious ? previousSelectedSerial : state.adbDevices[0].serial;
+      adbDeviceSelectEl.value = selectedSerial;
+      appendLog(`已自动选中设备：${selectedSerial}`);
+    }
     appendLog(`ADB 设备检测完成，共 ${state.adbDevices.length} 台在线设备。`);
   } catch (error) {
     appendLog(`ADB 设备检测失败：${error.message || String(error)}`);
@@ -246,6 +259,12 @@ btnStartEl.addEventListener("click", async () => {
 
     appendLog(`完成，共生成 ${result.generated} 个视频。`);
     appendLog(`ffmpeg 路径：${result.ffmpegPath}`);
+    if (result.outputSpec) {
+      appendLog(`输出规格：${result.outputSpec}`);
+    }
+    appendLog(
+      `编码器：${result.hwEncoder ? `${result.hwEncoder}（硬件加速）` : "libx264（CPU）"}`
+    );
     appendLog(`保存目标：${result.targetType === "adb" ? "手机(ADB)" : "本地文件夹"}`);
     appendLog(`输出音量倍率：${audioVolume}`);
     appendLog(`视频亮度：${videoBrightness.toFixed(2)}`);

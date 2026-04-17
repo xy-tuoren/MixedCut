@@ -47,6 +47,36 @@ function resolveBundledAdbPath() {
   return fsSync.existsSync(bundled) ? bundled : null;
 }
 
+function buildAdbCommandCandidates() {
+  const candidates = [];
+
+  if (process.platform === "win32") {
+    const packagedAdb = resolveBundledAdbPath();
+    if (packagedAdb) candidates.push(packagedAdb);
+
+    // 开发态优先尝试项目内 resources/adb/win/adb.exe（由 prepare:adb:win 下载）
+    const devBundled = path.join(__dirname, "resources", "adb", "win", "adb.exe");
+    if (fsSync.existsSync(devBundled)) candidates.push(devBundled);
+
+    // 兼容从项目根启动的场景
+    const cwdBundled = path.join(process.cwd(), "resources", "adb", "win", "adb.exe");
+    if (fsSync.existsSync(cwdBundled)) candidates.push(cwdBundled);
+
+    const sdkRoots = [process.env.ANDROID_SDK_ROOT, process.env.ANDROID_HOME].filter(Boolean);
+    for (const sdkRoot of sdkRoots) {
+      const sdkAdb = path.join(sdkRoot, "platform-tools", "adb.exe");
+      if (fsSync.existsSync(sdkAdb)) candidates.push(sdkAdb);
+    }
+  }
+
+  candidates.push("adb");
+  return [...new Set(candidates)];
+}
+
+function resolveAdbCommand() {
+  return buildAdbCommandCandidates()[0];
+}
+
 async function pickDirectory() {
   const result = await dialog.showOpenDialog({
     properties: ["openDirectory"]
@@ -152,6 +182,16 @@ function runCommand(command, args) {
     });
     child.on("error", (error) => {
       if (error && error.code === "ENOENT") {
+        const commandName = path.basename(command).toLowerCase();
+        const isAdbMissing = commandName === "adb" || commandName === "adb.exe";
+        if (isAdbMissing) {
+          reject(
+            new Error(
+              "未找到 adb 可执行文件。开发调试请先执行 `npm run prepare:adb:win` 下载到项目 resources，或自行安装 Android Platform Tools 并确保 `adb` 在 PATH 中。"
+            )
+          );
+          return;
+        }
         reject(
           new Error(
             `未找到可执行文件：${command}。如果你选择了手机(ADB)保存，请安装/配置 adb，或在安装包内置 adb 后重新打包。`
@@ -185,13 +225,13 @@ function parseAdbDevicesOutput(raw) {
 }
 
 async function listAdbDevices() {
-  const adbCommand = resolveBundledAdbPath() || "adb";
+  const adbCommand = resolveAdbCommand();
   const result = await runCommand(adbCommand, ["devices", "-l"]);
   return parseAdbDevicesOutput(result.stdout);
 }
 
 async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
-  const adbCommand = resolveBundledAdbPath() || "adb";
+  const adbCommand = resolveAdbCommand();
   const fileUri = `file://${remoteFilePath}`;
   const dirUri = `file://${remoteDirPath}`;
 
@@ -234,7 +274,7 @@ async function triggerAdbMediaScan(serial, remoteFilePath, remoteDirPath) {
 }
 
 async function pushToAdbDevice(serial, adbDirPath, localFilePath) {
-  const adbCommand = resolveBundledAdbPath() || "adb";
+  const adbCommand = resolveAdbCommand();
   const normalizedDir = adbDirPath.replace(/\\/g, "/").trim();
   await runCommand(adbCommand, ["-s", serial, "shell", "mkdir", "-p", normalizedDir]);
   await runCommand(adbCommand, ["-s", serial, "push", localFilePath, normalizedDir]);
@@ -243,78 +283,238 @@ async function pushToAdbDevice(serial, adbDirPath, localFilePath) {
   return remoteFilePath;
 }
 
-async function runFfmpegConcat(ffmpegPath, clips, outputFile, audioVolume, videoBrightness) {
-  const tempListPath = path.join(
-    os.tmpdir(),
-    `mixedcut-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`
-  );
-  const concatContent = clips.map(toConcatFileLine).join("\n");
-  await fs.writeFile(tempListPath, concatContent, "utf-8");
+const OUTPUT_WIDTH = 1080;
+const OUTPUT_HEIGHT = 1920;
+const OUTPUT_FPS = 30;
 
-  const args = [
-    "-y",
-    // 生成更稳定时间戳，减少拼接后画面抖动/跳帧
-    "-fflags",
-    "+genpts",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    tempListPath
+let cachedHwEncoder;
+let hwEncoderDetectionPromise = null;
+
+const PROBE_TIMEOUT_MS = 5000;
+
+async function detectHwEncoder(ffmpegPath) {
+  if (cachedHwEncoder !== undefined) return cachedHwEncoder;
+  if (hwEncoderDetectionPromise) return hwEncoderDetectionPromise;
+
+  const probe = (encoder) =>
+    new Promise((resolve) => {
+      let finished = false;
+      const child = spawn(
+        ffmpegPath,
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          "color=c=black:s=128x128:d=0.1",
+          "-c:v",
+          encoder,
+          "-f",
+          "null",
+          "-"
+        ],
+        { windowsHide: true }
+      );
+      // 防止某些驱动下 stderr 被填满导致子进程阻塞
+      if (child.stdout) child.stdout.on("data", () => {});
+      if (child.stderr) child.stderr.on("data", () => {});
+      const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        try {
+          child.kill("SIGKILL");
+        } catch (_) {
+          /* ignore */
+        }
+        resolve(false);
+      }, PROBE_TIMEOUT_MS);
+      child.on("error", () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve(false);
+      });
+      child.on("close", (code) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve(code === 0);
+      });
+    });
+
+  hwEncoderDetectionPromise = (async () => {
+    const candidates = ["h264_nvenc", "h264_qsv", "h264_amf"];
+    for (const enc of candidates) {
+      try {
+        if (await probe(enc)) {
+          cachedHwEncoder = enc;
+          return enc;
+        }
+      } catch (_) {
+        /* 继续尝试下一个 */
+      }
+    }
+    cachedHwEncoder = null;
+    return null;
+  })();
+
+  return hwEncoderDetectionPromise;
+}
+
+function buildNormalizeFilter(videoBrightness) {
+  const parts = [
+    `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease`,
+    `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black`,
+    "setsar=1",
+    `fps=${OUTPUT_FPS}`
   ];
+  if (videoBrightness !== 0) parts.push(`eq=brightness=${videoBrightness}`);
+  return parts.join(",");
+}
 
-  // 亮度为 0 时不加视频滤镜，减少不必要的重编码开销
-  if (videoBrightness !== 0) {
-    args.push("-vf", `eq=brightness=${videoBrightness}`);
+function pushVideoEncoderArgs(args, hwEncoder) {
+  switch (hwEncoder) {
+    case "h264_nvenc":
+      args.push(
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p4",
+        "-tune",
+        "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        "23",
+        "-b:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p"
+      );
+      break;
+    case "h264_qsv":
+      args.push(
+        "-c:v",
+        "h264_qsv",
+        "-preset",
+        "veryfast",
+        "-global_quality",
+        "23",
+        "-pix_fmt",
+        "nv12"
+      );
+      break;
+    case "h264_amf":
+      args.push(
+        "-c:v",
+        "h264_amf",
+        "-quality",
+        "speed",
+        "-rc",
+        "cqp",
+        "-qp_i",
+        "23",
+        "-qp_p",
+        "23",
+        "-pix_fmt",
+        "yuv420p"
+      );
+      break;
+    default:
+      args.push(
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "0"
+      );
   }
+}
 
-  args.push(
-    "-c:v",
-    "libx264",
-    "-vsync",
-    "cfr",
-    "-r",
-    "30",
-    "-pix_fmt",
-    "yuv420p",
-    "-preset",
-    "fast",
-    "-crf",
-    "18",
-    "-movflags",
-    "+faststart"
-  );
-  if (audioVolume <= 0) {
-    // 音量为 0 时直接不输出音轨，可规避大量音频损坏导致的失败
-    args.push("-an");
-  } else if (audioVolume === 1) {
-    // 音量不变时直接复制音轨，避免不必要的音频重编码
-    args.push("-c:a", "copy");
-  } else {
-    args.push("-af", `volume=${audioVolume}`, "-c:a", "aac", "-b:a", "192k");
-  }
-  args.push(outputFile);
-
-  let stderr = "";
-  try {
-    await new Promise((resolve, reject) => {
+async function runFfmpegConcat(
+  ffmpegPath,
+  clips,
+  outputFile,
+  audioVolume,
+  videoBrightness,
+  hwEncoder
+) {
+  const runArgs = (args) =>
+    new Promise((resolve, reject) => {
+      let stderr = "";
       const child = spawn(ffmpegPath, args, { windowsHide: true });
       child.stderr.on("data", (chunk) => {
         stderr += chunk.toString();
       });
       child.on("error", (error) => reject(error));
       child.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg 执行失败（退出码 ${code}）`));
+        if (code === 0) resolve(stderr);
+        else {
+          const tail = stderr.slice(-600);
+          reject(new Error(`ffmpeg 执行失败（退出码 ${code}）: ${tail}`));
+        }
       });
     });
+
+  const videoFilter = buildNormalizeFilter(videoBrightness);
+  const hasAudio = audioVolume > 0;
+
+  // concat filter：逐片独立解码并统一到 1080x1920@30、立体声 44.1kHz
+  // 必须用此路径：不同素材的编码/分辨率/声道/像素格式常常不一致，
+  // concat demuxer 在这种情况下会失败或极慢（逐帧艰难输出）。
+  const buildFilterArgs = (useHwEncoder) => {
+    const args = ["-y"];
+    for (const clip of clips) args.push("-i", clip);
+    const n = clips.length;
+    let filter = "";
+    for (let i = 0; i < n; i += 1) {
+      filter += `[${i}:v]${videoFilter}[v${i}];`;
+      if (hasAudio) {
+        let a =
+          `[${i}:a]aresample=async=1:first_pts=0,` +
+          "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100";
+        if (audioVolume !== 1) a += `,volume=${audioVolume}`;
+        filter += `${a}[a${i}];`;
+      }
+    }
+    let concatIn = "";
+    for (let i = 0; i < n; i += 1) {
+      concatIn += `[v${i}]`;
+      if (hasAudio) concatIn += `[a${i}]`;
+    }
+    filter += `${concatIn}concat=n=${n}:v=1:a=${hasAudio ? 1 : 0}[vout]${
+      hasAudio ? "[aout]" : ""
+    }`;
+    args.push("-filter_complex", filter, "-map", "[vout]");
+    if (hasAudio) args.push("-map", "[aout]");
+    args.push("-r", String(OUTPUT_FPS), "-fps_mode", "cfr");
+    pushVideoEncoderArgs(args, useHwEncoder);
+    if (hasAudio) args.push("-c:a", "aac", "-b:a", "128k");
+    else args.push("-an");
+    args.push("-movflags", "+faststart", outputFile);
+    return args;
+  };
+
+  try {
+    try {
+      await runArgs(buildFilterArgs(hwEncoder));
+      return;
+    } catch (hwError) {
+      if (!hwEncoder) throw hwError;
+      // 硬件编码单次失败时兜底用 libx264（例如 QSV 输入异常、驱动暂挂起等）
+      await fs.unlink(outputFile).catch(() => {});
+      await runArgs(buildFilterArgs(null));
+    }
   } catch (error) {
-    // 非 0 退出时清理半成品，避免把短视频残片误当作成功输出
     await fs.unlink(outputFile).catch(() => {});
-    throw new Error(`${error.message}: ${stderr}`);
-  } finally {
-    await fs.unlink(tempListPath).catch(() => {});
+    throw error;
   }
 }
 
@@ -343,7 +543,15 @@ ipcMain.handle("get-source-stats", async (_event, sourceDir) => {
 
 ipcMain.handle("list-adb-devices", async () => listAdbDevices());
 
-ipcMain.handle("start-mix", async (_event, payload) => {
+ipcMain.handle("start-mix", async (event, payload) => {
+  const reportProgress = (message) => {
+    try {
+      event.sender.send("mix-progress", { message, time: Date.now() });
+    } catch (_) {
+      /* 窗口已关闭则忽略 */
+    }
+  };
+
   const {
     sourceDir,
     outputDir,
@@ -400,6 +608,12 @@ ipcMain.handle("start-mix", async (_event, payload) => {
   if (!ffmpegPath) {
     throw new Error("未找到可用的 ffmpeg 可执行文件");
   }
+  reportProgress("检测硬件编码器...");
+  const hwEncoder = await detectHwEncoder(ffmpegPath);
+  reportProgress(
+    hwEncoder ? `将使用硬件编码器：${hwEncoder}` : "未检测到可用硬件编码器，使用 libx264 (CPU)"
+  );
+  reportProgress(`输出规格：${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}@${OUTPUT_FPS}，共需生成 ${count} 个视频`);
 
   const finalOutputDir =
     targetType === "local"
@@ -430,11 +644,20 @@ ipcMain.handle("start-mix", async (_event, payload) => {
 
       const outputFile = path.join(finalOutputDir, `mixed_${String(i + 1).padStart(3, "0")}.mp4`);
       await fs.unlink(outputFile).catch(() => {});
+      if (retry === 0) {
+        reportProgress(`#${i + 1}/${count} 开始编码（顺序 ${order.map((x) => x + 1).join("-")}）`);
+      } else {
+        reportProgress(`#${i + 1}/${count} 第 ${retry + 1} 次尝试...`);
+      }
+      const encodeStart = Date.now();
       try {
-        await runFfmpegConcat(ffmpegPath, clips, outputFile, volume, brightness);
+        await runFfmpegConcat(ffmpegPath, clips, outputFile, volume, brightness, hwEncoder);
         finalOrder = order;
         pickedClips = clips;
         uniqueKey = key;
+        reportProgress(
+          `#${i + 1}/${count} 完成，用时 ${((Date.now() - encodeStart) / 1000).toFixed(1)}s`
+        );
         break;
       } catch (error) {
         lastConcatError = error;
@@ -442,6 +665,9 @@ ipcMain.handle("start-mix", async (_event, payload) => {
         for (const clip of clips) {
           clipFailScores.set(clip, (clipFailScores.get(clip) || 0) + 1);
         }
+        reportProgress(
+          `#${i + 1}/${count} 第 ${retry + 1} 次失败，换一组重试：${(error.message || "").slice(0, 120)}`
+        );
       }
     }
 
@@ -475,6 +701,8 @@ ipcMain.handle("start-mix", async (_event, payload) => {
   return {
     generated: results.length,
     ffmpegPath,
+    hwEncoder: hwEncoder || null,
+    outputSpec: `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}@${OUTPUT_FPS}`,
     targetType,
     results
   };
@@ -482,6 +710,15 @@ ipcMain.handle("start-mix", async (_event, payload) => {
 
 app.whenReady().then(() => {
   createWindow();
+  // 后台预热：应用启动后就开始探测硬件编码器，用户首次点击混剪时无需等待
+  try {
+    const earlyFfmpeg = resolveFfmpegPath();
+    if (earlyFfmpeg) {
+      detectHwEncoder(earlyFfmpeg).catch(() => {});
+    }
+  } catch (_) {
+    /* 忽略启动期探测错误 */
+  }
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
