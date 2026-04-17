@@ -481,6 +481,10 @@ function buildCacheAudioFilter(audioVolume) {
   return audioFilter;
 }
 
+function formatDateTime(ts) {
+  return new Date(ts).toLocaleString("zh-CN", { hour12: false });
+}
+
 async function transcodeClipToCache(ffmpegPath, sourceClip, outputClip, audioVolume, videoBrightness) {
   await fs.mkdir(path.dirname(outputClip), { recursive: true });
   const tempClip = path.join(
@@ -890,6 +894,8 @@ ipcMain.handle("start-mix", async (event, payload) => {
       /* 窗口已关闭则忽略 */
     }
   };
+  const taskStartAt = Date.now();
+  reportProgress(`任务开始：${formatDateTime(taskStartAt)}`);
 
   const {
     sourceDir,
@@ -1166,6 +1172,13 @@ ipcMain.handle("start-mix", async (event, payload) => {
   if (useEncodedClipCache) {
     await cleanupEncodeCache(encodeCacheRoot, reportProgress).catch(() => {});
   }
+  const taskEndAt = Date.now();
+  reportProgress(
+    `处理时间：开始 ${formatDateTime(taskStartAt)}，结束 ${formatDateTime(taskEndAt)}，耗时 ${(
+      (taskEndAt - taskStartAt) /
+      1000
+    ).toFixed(1)}s`
+  );
 
   return {
     generated: ok.length,
